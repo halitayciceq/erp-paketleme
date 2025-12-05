@@ -2037,7 +2037,7 @@ const transferIstasyondanSevkiyata = () => {
         }
         /* Ekran önizleme genişliği */
         @media screen {
-          .packing-page { width: 100%; max-width: 930px; margin: 0 auto; padding: 24px 24px 32px; }
+          .packing-page { width: 100%; max-width: 1180px; margin: 0 auto; padding: 24px 24px 32px; }
         }
         /* Packing List stilleri */
         .pl-box {
@@ -2383,7 +2383,7 @@ const transferIstasyondanSevkiyata = () => {
 
       {/* Packing List Print Preview */}
       <Dialog open={packingListOpen} onOpenChange={setPackingListOpen}>
-        <DialogContent className="w-full h-[95vh] max-w-[930px] max-h-none overflow-auto print-container bg-gray-100 p-0">
+        <DialogContent className="w-[98vw] h-[95vh] max-w-[1250px] max-h-none overflow-auto print-container bg-gray-100 p-0">
           <DialogHeader className="no-print px-6 pt-6 sticky top-0 bg-white z-10">
             <DialogTitle>Paketleme Takip Paneli · Packing List</DialogTitle>
           </DialogHeader>
@@ -3663,7 +3663,7 @@ const transferIstasyondanSevkiyata = () => {
 
       {/* PACKING LIST ÖNİZLEME / PRINT DIALOG */}
       <Dialog open={packingListOpen} onOpenChange={setPackingListOpen}>
-        <DialogContent className="max-w-[930px] p-0 print-container">
+        <DialogContent className="w-[98vw] max-w-[1250px] max-h-[95vh] overflow-auto p-0 print-container">
           <div className="packing-page bg-white text-black">
             {/* Logo + Title Bar */}
             <div className="pt-6 px-10 flex flex-col items-center gap-4">
