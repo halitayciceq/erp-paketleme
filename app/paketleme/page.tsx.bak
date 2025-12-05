@@ -1,0 +1,2604 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableCell,
+  TableBody,
+} from "@/components/ui/table";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import QRCode from "qrcode";
+import { Barcode } from "lucide-react";
+
+/**
+ * ERP Paketleme Paneli
+ * - Sipariş listesi
+ * - Ürün listesi (kalan, atanan paket(ler), ata)
+ * - Palet / Sandık yönetimi (durum: Hazırlanıyor -> Kapat/Tamamlandı)
+ * - QR: Container ve Sipariş level yazdırma önizleme
+ * - “Kalan=0” ise ürün bazında Tamamlandı rozetleri
+ */
+
+type Siparis = {
+  no: string;
+  tarih: string;
+  teslim: string;
+  adi: string;
+  surec: string;
+  asama: string;
+  proje: string;
+  musteriAdi: string;
+  istasyonAdi: string;
+  paketleyenler: string[];
+};
+
+type UrunAtama = { no: string; adet: number; paketleyen?: string };
+
+type Urun = {
+  kod: string;
+  ad: string;
+  adet: number; // toplam
+  tur: "Palet" | "Sandık" | string;
+  atananlar: UrunAtama[]; // paket/palet bazında dağıtımlar
+  kalan: number;
+  istasyon?: string;
+};
+
+type Konteyner = {
+  no: string; // P001 / S002
+  tip: "Palet" | "Sandık" | "Kutu" | "Poşet";
+  siparis: string; // Sipariş no
+  urunKodlari: string[]; // benzersiz ürün kodları
+  adet: number; // konteynerdeki toplam adet
+  durum: "Hazırlanıyor" | "Tamamlandı" | string;
+  children?: string[]; // bağlı Kutu/Poşet numaraları
+  sevkiyatYetkilisi?: string;
+  aracTuru?: string;
+  aracNo?: string;
+  soforAdi?: string;
+};
+
+type PrintTarget =
+  | { type: "order"; orderNo: string }
+  | { type: "container"; containerNo: string }
+  | { type: "station"; product: string }
+  | { type: "shipmentGroup"; groupKey: string };
+
+type Stage = "panel" | "istasyon" | "sevkiyat" | "yukleme";
+
+export default function PaketlemeTakipPaneli() {
+  const ISTASYON_PAKETLEYEN: Record<string, string> = {
+    "Depo": "Münür Mutlu",
+    "Kesim Hane": "Mustafa Emre",
+    "Boyahane": "Fahrettin Çakır",
+    "Talaşlı İmalat": "Uğur Karakaşoğlu",
+    "Montaj": "Zeki Olğaç",
+  };
+  const ISTASYON_KOD: Record<string, string> = {
+    "Depo": "DEP",
+    "Kesim Hane": "KES",
+    "Boyahane": "BOY",
+    "Talaşlı İmalat": "TAL",
+    "Montaj": "MON",
+  };
+  const PREFIX_TO_ISTASYON: Record<string, string> = useMemo(() => {
+    const m: Record<string, string> = {};
+    Object.entries(ISTASYON_KOD).forEach(([ad, kod]) => { m[kod] = ad; });
+    return m;
+  }, []);
+  const [selectedSiparis, setSelectedSiparis] = useState<Siparis | null>(null);
+  const [showModal, setShowModal] = useState(false);
+  const [selectedUrun, setSelectedUrun] = useState<Urun | null>(null);
+
+  // Modal state
+  const [paketTipi, setPaketTipi] = useState<"palet" | "sandik" | "kutu" | "poset" | "">("");
+  const [seciliKonteyner, setSeciliKonteyner] = useState<string>(""); // mevcut no veya "yeni"
+  const [adet, setAdet] = useState<number>(0);
+  const [hata, setHata] = useState<string>("");
+
+  // Badge edit state
+  const [editPK, setEditPK] = useState<{ urunKod: string; paketNo: string } | null>(null);
+  const [editQty, setEditQty] = useState<number>(0);
+
+  const [seciliPaketleyen, setSeciliPaketleyen] = useState<string>("");
+  const [seciliSevkiyatYetkilisi, setSeciliSevkiyatYetkilisi] = useState<string>("");
+
+  // Sevkiyat transfer UI state
+  const [transferTip, setTransferTip] = useState<"Palet" | "Sandık">("Palet");
+  const [seciliKucuk, setSeciliKucuk] = useState<Record<string, boolean>>({});
+  const [transferQuantities, setTransferQuantities] = useState<Record<string, number>>({});
+  const [transferCounts, setTransferCounts] = useState<{ Kutu: number; Poşet: number }>({ Kutu: 0, Poşet: 0 });
+  const [childrenHints, setChildrenHints] = useState<Record<string, string[]>>({});
+  const [moveLog, setMoveLog] = useState<Record<string, Record<string, { child: string; qty: number }[]>>>({});
+  const [capsuleArchive, setCapsuleArchive] = useState<Record<string, number>>({});
+  const [sevkiyatModalOpen, setSevkiyatModalOpen] = useState(false);
+  const [seciliKucukNo, setSeciliKucukNo] = useState<string | null>(null);
+  const [sevkiyatTargetTip, setSevkiyatTargetTip] = useState<"Palet" | "Sandık">("Palet");
+  const [sevkiyatTargetNo, setSevkiyatTargetNo] = useState<string>("");
+  // Sevkiyat grouped assignment state
+  const [sevkiyatGroup, setSevkiyatGroup] = useState<SevkGroup | null>(null);
+  const [sevkiyatQty, setSevkiyatQty] = useState<number>(1);
+  // Sevkiyat grouped popover temporary counter (key = `${groupKey}-${parentNo}`)
+  const [groupEditCounts, setGroupEditCounts] = useState<Record<string, number>>({});
+
+  // Print Preview state
+  const [printOpen, setPrintOpen] = useState(false);
+  const [printTarget, setPrintTarget] = useState<PrintTarget | null>(null);
+  const [qrMap, setQrMap] = useState<Record<string, string>>({}); // containerNo | order:<no> | <order>-<container>
+  const [orderQR, setOrderQR] = useState<string>("");
+  const [siparisAsama, setSiparisAsama] = useState<string>("Checklist Hazırlandı");
+
+  const ARAC_TURLERI = ["Kamyon", "Tır", "Kamyonet", "Panelvan", "Forklift", "Diğer"];
+
+  const updateContainer = (no: string, updates: Partial<Konteyner>) => {
+    setPaletler(prev => prev.map(p => (p.no === no ? { ...p, ...updates } : p)));
+  };
+
+  // UI: Süreç aşaması (sekme)
+  const [aktifAsama, setAktifAsama] = useState<Stage>("panel");
+
+  const handleStageNavClick = (target: Stage) => {
+    if (target === "panel") {
+      setAktifAsama("panel");
+    }
+  };
+
+  const handleGoToIstasyon = () => {
+    if (!selectedSiparis) return;
+    setAktifAsama("istasyon");
+  };
+
+  // DEMO veriler
+  const siparisler: Siparis[] = [
+    {
+      no: "SA-250355",
+      tarih: "21/10/2025",
+      teslim: "24/01/2026",
+      adi: "10 - 16 TON ÇKK GEZER VİNÇ",
+      surec: "Sevke Aktarıldı",
+      asama: "Checklist Hazırlandı",
+      proje: "10 - 16 TON ÇKK GEZER VİNÇ",
+      musteriAdi: "Arnikon Müh A.Ş.",
+      istasyonAdi: "Montaj",
+      paketleyenler: [
+        "Münür Mutlu", // Depo
+        "Mustafa Emre", // Kesim Hane
+        "Fahrettin Çakır", // Boyahane
+        "Uğur Karakaşoğlu", // Talaşlı İmalat
+        "Zeki Olğaç", // Montaj
+      ],
+    },
+  ];
+
+  const [urunler, setUrunler] = useState<Urun[]>([
+    {
+      kod: "URN-00045",
+      ad: "Çelik Kiriş",
+      adet: 12,
+      tur: "Sandık",
+      atananlar: [],
+      kalan: 12,
+      istasyon: "Kesim Hane",
+    },
+    {
+      kod: "URN-00046",
+      ad: "Motor Ünitesi",
+      adet: 3,
+      tur: "Palet",
+      atananlar: [],
+      kalan: 3,
+      istasyon: "Talaşlı İmalat",
+    },
+    {
+      kod: "URN-00047",
+      ad: "Kumanda Paneli",
+      adet: 6,
+      tur: "Palet",
+      atananlar: [],
+      kalan: 6,
+      istasyon: "Montaj",
+    },
+    {
+      kod: "URN-00048",
+      ad: "Kablo Seti",
+      adet: 8,
+      tur: "Kutu",
+      atananlar: [],
+      kalan: 8,
+      istasyon: "Depo",
+    },
+  {
+    kod: "URN-00049",
+    ad: "Boya Takımı",
+    adet: 4,
+    tur: "Sandık",
+    atananlar: [],
+    kalan: 4,
+    istasyon: "Boyahane",
+  },
+]);
+
+  const tumUrunlerTamamlandi = useMemo(() => urunler.every((u) => u.kalan === 0), [urunler]);
+
+  const [paletler, setPaletler] = useState<Konteyner[]>([]);
+
+  // ----- derived -----
+  const paletMap = useMemo(() => {
+    const map = new Map<string, Konteyner>();
+    for (const p of paletler) map.set(p.no, p);
+    return map;
+  }, [paletler]);
+
+  const paletlerFlat = useMemo(
+    () =>
+      paletler.map((p) => ({
+        ...p,
+        urunSayisi: new Set(p.urunKodlari).size,
+      })),
+    [paletler]
+  );
+
+  const urunMap = useMemo(() => {
+    const map = new Map<string, Urun>();
+    for (const u of urunler) map.set(u.kod, u);
+    return map;
+  }, [urunler]);
+
+  // Sevkiyat transfer: istasyondan gelen küçük paketler (Kutu/Poşet)
+  const istasyonKapsulleri = useMemo(() => paletlerFlat.filter(p => p.tip === "Kutu" || p.tip === "Poşet"), [paletlerFlat]);
+  // Küçük paket seçimini değiştir
+  const toggleKucukSecim = (no: string) => {
+    setSeciliKucuk(prev => ({ ...prev, [no]: !prev[no] }));
+  };
+  const selectedNos = useMemo(() => Object.entries(seciliKucuk).filter(([_, v]) => v).map(([k]) => k), [seciliKucuk]);
+  const selectedSummary = useMemo(() => {
+    const sum: Record<string, { kod: string; ad: string; adet: number }> = {};
+    for (const u of urunler) {
+      let total = 0;
+      for (const a of u.atananlar) if (selectedNos.includes(a.no)) total += a.adet;
+      if (total > 0) sum[u.kod] = { kod: u.kod, ad: u.ad, adet: total };
+    }
+    return sum;
+  }, [urunler, selectedNos]);
+
+  const selectedByType = useMemo(() => {
+    const map: { Kutu: string[]; Poşet: string[] } = { Kutu: [], Poşet: [] };
+    for (const no of selectedNos) {
+      const t = paletMap.get(no)?.tip;
+      if (t === 'Kutu' || t === 'Poşet') map[t].push(no);
+    }
+    return map;
+  }, [selectedNos, paletMap]);
+
+  useEffect(() => {
+    setTransferCounts({ Kutu: selectedByType.Kutu.length, Poşet: selectedByType.Poşet.length });
+  }, [selectedByType]);
+
+  useEffect(() => {
+    setCapsuleArchive((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const c of paletler) {
+        if ((c.tip === "Kutu" || c.tip === "Poşet") && c.adet > 0) {
+          if (next[c.no] !== c.adet) {
+            next[c.no] = c.adet;
+            changed = true;
+          }
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [paletler]);
+
+  const recordCapsuleTotals = (moves: Record<string, { child: string; qty: number }[]>) => {
+    const totals = new Map<string, number>();
+    for (const arr of Object.values(moves)) {
+      for (const { child, qty } of arr) {
+        totals.set(child, (totals.get(child) || 0) + qty);
+      }
+    }
+    if (totals.size === 0) return;
+    setCapsuleArchive((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      totals.forEach((qty, child) => {
+        if (qty > 0) {
+          const current = next[child] ?? 0;
+          const normalized = Math.max(current, qty);
+          if (normalized !== current) {
+            next[child] = normalized;
+            changed = true;
+          }
+        }
+      });
+      return changed ? next : prev;
+    });
+  };
+
+  // --- Sevkiyat: Kutu/Poşet grupları (Sipariş+İstasyonPrefix+Tip) ---
+  const parseStationAndType = (no: string) => {
+    // examples: KES-P001, DEP-K002
+    const [prefix, rest] = no.includes('-') ? no.split('-') : ["", no];
+    const tip = rest.startsWith('K') ? 'Kutu' : rest.startsWith('P') ? 'Poşet' : '';
+    return { prefix, tip } as { prefix: string; tip: 'Kutu' | 'Poşet' | '' };
+  };
+
+  type SevkGroup = {
+    key: string;            // `${siparis}-${prefix}-${tip}`
+    siparis: string;
+    prefix: string;         // KES, DEP, MON...
+    tip: 'Kutu' | 'Poşet';
+    paketNoSummary: string; // e.g. `KES-K*` / `KES-P*`
+    children: string[];     // kapsül ID listesi (KES-K001, ...)
+    kiad: number;           // toplam ürün adedi (kutu içi toplam)
+    adet: number;           // kapsül sayısı
+    assignedMap: Record<string, number>; // { P001: 2, S003: 1 }
+    assignedCount: number;  // atanmış kapsül sayısı (sum of assignedMap)
+    kalan: number;          // adet - assignedCount
+    tamamlandi: boolean;    // kalan === 0
+  };
+
+  const sevkiyatGruplari: SevkGroup[] = useMemo(() => {
+    const allSmall = paletler.filter(p => (p.tip === 'Kutu' || p.tip === 'Poşet') && p.siparis === (selectedSiparis?.no || siparisler[0].no));
+    const byKey = new Map<string, SevkGroup>();
+
+    // Index: hangi küçük kapsül hangi palet/sandık altında?
+    const parentByChild = new Map<string, string>();
+    for (const c of paletler) {
+      if (c.tip === 'Palet' || c.tip === 'Sandık') {
+        for (const ch of c.children || []) parentByChild.set(ch, c.no);
+      }
+    }
+    // Merge in childrenHints (pending or recently-added children)
+    for (const [parent, kids] of Object.entries(childrenHints)) {
+      const p = paletMap.get(parent);
+      if (p && (p.tip === 'Palet' || p.tip === 'Sandık')) {
+        for (const ch of kids) parentByChild.set(ch, parent);
+      }
+    }
+
+    const movedByChild = new Map<string, number>();
+    for (const moves of Object.values(moveLog)) {
+      for (const entries of Object.values(moves)) {
+        for (const entry of entries) {
+          movedByChild.set(entry.child, (movedByChild.get(entry.child) || 0) + entry.qty);
+        }
+      }
+    }
+
+    for (const k of allSmall) {
+      const { prefix, tip } = parseStationAndType(k.no);
+      if (!prefix || !tip) continue;
+      const key = `${selectedSiparis?.no || siparisler[0].no}-${prefix}-${tip}`;
+      if (!byKey.has(key)) byKey.set(key, {
+        key,
+        siparis: selectedSiparis?.no || siparisler[0].no,
+        prefix,
+        tip: tip as ('Kutu'|'Poşet'),
+        paketNoSummary: `${prefix}-${tip === 'Kutu' ? 'K*' : 'P*'}`,
+        children: [],
+        kiad: 0,
+        adet: 0,
+        assignedMap: {},
+        assignedCount: 0,
+        kalan: 0,
+        tamamlandi: false,
+      });
+      const g = byKey.get(key)!;
+      g.children.push(k.no);
+      g.adet += 1;
+      // kapsül içindeki ürün toplamı
+      const currentQty = getContainerLines(k.no).reduce((s, r) => s + r.adet, 0);
+      const movedQty = movedByChild.get(k.no) || 0;
+      let inside = currentQty + movedQty;
+      if (inside === 0) {
+        const fallback = paletMap.get(k.no)?.adet ?? 0;
+        if (fallback > 0) inside = fallback;
+        const archived = capsuleArchive[k.no];
+        if (inside === 0 && archived && archived > 0) inside = archived;
+      }
+      g.kiad += inside;
+      // atanmış mı?
+      const parent = parentByChild.get(k.no);
+      if (parent) {
+        g.assignedMap[parent] = (g.assignedMap[parent] || 0) + 1;
+        g.assignedCount += 1;
+      }
+    }
+
+    for (const g of byKey.values()) {
+      g.kalan = Math.max(0, g.adet - g.assignedCount);
+      g.tamamlandi = g.kalan === 0 && g.adet > 0;
+    }
+    return Array.from(byKey.values());
+  }, [paletler, selectedSiparis, urunler, childrenHints, paletMap, moveLog, capsuleArchive]);
+
+  const paletSandiklar = useMemo(
+    () => paletler.filter((p) => p.tip === "Palet" || p.tip === "Sandık"),
+    [paletler]
+  );
+
+  const paletTipSayilari = useMemo(() => {
+    const counts: Record<string, number> = { Palet: 0, Sandık: 0 };
+    for (const p of paletSandiklar) {
+      if (p.tip === "Palet" || p.tip === "Sandık") {
+        counts[p.tip] = (counts[p.tip] || 0) + 1;
+      }
+    }
+    return counts;
+  }, [paletSandiklar]);
+
+  const sevkiyatTamamlandi = useMemo(() => {
+    if (paletSandiklar.length === 0) return false;
+    const groupsDone =
+      sevkiyatGruplari.length === 0 || sevkiyatGruplari.every((g) => g.tamamlandi);
+    if (!groupsDone) return false;
+    const hasContent = paletSandiklar.some((p) => p.adet > 0);
+    return hasContent;
+  }, [paletSandiklar, sevkiyatGruplari]);
+
+  const yuklemeTamamlandi = useMemo(
+    () => paletSandiklar.every((p) => p.durum === "Kamyona Yüklendi"),
+    [paletSandiklar]
+  );
+
+  useEffect(() => {
+    if (!tumUrunlerTamamlandi) {
+      setSiparisAsama("Checklist Hazırlandı");
+    } else if (!sevkiyatTamamlandi) {
+      setSiparisAsama("İstasyon Paketleme Tamamlandı");
+    } else if (!yuklemeTamamlandi) {
+      setSiparisAsama("Sevkiyat Paketleme Tamamlandı");
+    } else {
+      setSiparisAsama("Araca Yüklendi");
+    }
+  }, [tumUrunlerTamamlandi, sevkiyatTamamlandi, yuklemeTamamlandi]);
+
+  const openSevkiyatAta = (no: string) => {
+    setSeciliKucukNo(no);
+    setSevkiyatTargetTip("Palet");
+    setSevkiyatTargetNo("");
+    setHata("");
+    setSevkiyatModalOpen(true);
+  };
+
+  const openStationPrint = (urun: Urun) => {
+    setPrintTarget({ type: "station", product: urun.kod });
+    setPrintOpen(true);
+  };
+
+  const openShipmentGroupPrint = (groupKey: string) => {
+    setPrintTarget({ type: "shipmentGroup", groupKey });
+    setPrintOpen(true);
+  };
+
+// İstasyondan seçilen küçükleri sevkiyat konteynerine aktar
+const transferIstasyondanSevkiyata = () => {
+  const secilenNos = selectedNos;
+  if (secilenNos.length === 0) { setHata("Aktarmak için en az bir kutu/poşet seçin."); return; }
+
+  // Kaç poşet, kaç kutu aktaracağız?
+  const posetList = selectedByType.Poşet.slice(0, transferCounts.Poşet || 0);
+  const kutuList = selectedByType.Kutu.slice(0, transferCounts.Kutu || 0);
+  const chosen = Array.from(new Set([...posetList, ...kutuList]));
+  if (chosen.length === 0) { setHata("Aktarılacak paket adedi 0 olamaz."); return; }
+
+  const hedefNo = nextCode(transferTip);
+  setChildrenHints(prev => ({ ...prev, [hedefNo]: chosen }));
+  setPaletler(prev => ([...prev, {
+    no: hedefNo,
+    tip: transferTip,
+    siparis: selectedSiparis?.no || siparisler[0].no,
+    urunKodlari: [],
+    adet: 0,
+    durum: "Hazırlanıyor",
+    sevkiyatYetkilisi: seciliSevkiyatYetkilisi || undefined,
+    children: chosen,
+  }]));
+
+  // Hareket günlüğü: ürün bazlı, çocuk kutu/poşet ve miktarları logla
+  const productChildMoves: Record<string, { child: string; qty: number }[]> = {};
+
+  // Ürünlerde, seçilen küçük paketlerdeki TÜM miktarları hedef konteynere taşı
+  setUrunler(prev => {
+    const yeni = prev.map(u => {
+      let moved = 0;
+      const nextAt: UrunAtama[] = [];
+      for (const a of u.atananlar) {
+        if (chosen.includes(a.no)) {
+          // Logla: hangi ürün, hangi çocuk, kaç adet
+          if (!productChildMoves[u.kod]) productChildMoves[u.kod] = [];
+          productChildMoves[u.kod].push({ child: a.no, qty: a.adet });
+          moved += a.adet; // bu küçük paketteki tüm adetler taşınır
+        } else {
+          nextAt.push(a);
+        }
+      }
+      if (moved > 0) {
+        const idx = nextAt.findIndex(a => a.no === hedefNo);
+        if (idx === -1) nextAt.push({ no: hedefNo, adet: moved, paketleyen: seciliPaketleyen || undefined });
+        else nextAt[idx] = { ...nextAt[idx], adet: nextAt[idx].adet + moved };
+      }
+      const yeniKalan = u.adet - nextAt.reduce((s, a) => s + a.adet, 0);
+      return { ...u, atananlar: nextAt, kalan: yeniKalan };
+    });
+    recomputeContainersFromUrunler(yeni);
+    return yeni;
+  });
+
+  // Hareket günlüğünü kaydet
+  setMoveLog(prev => ({ ...prev, [hedefNo]: productChildMoves }));
+  recordCapsuleTotals(productChildMoves);
+
+  // Temizlik
+  setSeciliKucuk({});
+  setTransferQuantities({});
+  setTransferCounts({ Kutu: 0, Poşet: 0 });
+};
+
+  const commitSevkiyatAta = () => {
+    if (!seciliKucukNo) return;
+    const hedefNo = sevkiyatTargetNo === "yeni" ? nextCode(sevkiyatTargetTip) : sevkiyatTargetNo;
+    if (!hedefNo) { setHata("Hedef palet/sandık seçin."); return; }
+
+    if (sevkiyatTargetNo === "yeni") {
+      setPaletler(prev => ([...prev, {
+        no: hedefNo,
+        tip: sevkiyatTargetTip,
+        siparis: selectedSiparis?.no || siparisler[0].no,
+        urunKodlari: [],
+        adet: 0,
+        durum: "Hazırlanıyor",
+        sevkiyatYetkilisi: seciliSevkiyatYetkilisi || undefined,
+        children: [seciliKucukNo],
+      }]));
+    } else {
+      setPaletler(prev => prev.map(p => p.no === hedefNo
+        ? { ...p, children: Array.from(new Set([...(p.children || []), seciliKucukNo])) }
+        : p
+      ));
+    }
+    setChildrenHints(prev => ({ ...prev, [hedefNo]: Array.from(new Set([...(prev[hedefNo] || []), seciliKucukNo])) }));
+
+    const productChildMoves: Record<string, { child: string; qty: number }[]> = {};
+
+    setUrunler(prev => {
+      const yeni = prev.map(u => {
+        let moved = 0;
+        const nextAt: UrunAtama[] = [];
+        for (const a of u.atananlar) {
+          if (a.no === seciliKucukNo) {
+            if (!productChildMoves[u.kod]) productChildMoves[u.kod] = [];
+            productChildMoves[u.kod].push({ child: seciliKucukNo, qty: a.adet });
+            moved += a.adet;
+          } else {
+            nextAt.push(a);
+          }
+        }
+        if (moved > 0) {
+          const idx = nextAt.findIndex(a => a.no === hedefNo);
+          if (idx === -1) nextAt.push({ no: hedefNo, adet: moved });
+          else nextAt[idx] = { ...nextAt[idx], adet: nextAt[idx].adet + moved };
+        }
+        const yeniKalan = u.adet - nextAt.reduce((s, a) => s + a.adet, 0);
+        return { ...u, atananlar: nextAt, kalan: yeniKalan };
+      });
+      recomputeContainersFromUrunler(yeni);
+      return yeni;
+    });
+
+    setMoveLog(prev => ({
+      ...prev,
+      [hedefNo]: {
+        ...(prev[hedefNo] || {}),
+        ...Object.fromEntries(Object.entries(productChildMoves).map(([k, v]) => [k, [ ...(prev[hedefNo]?.[k] || []), ...v ]]))
+      }
+    }));
+    recordCapsuleTotals(productChildMoves);
+
+    setSevkiyatModalOpen(false);
+    setSeciliKucukNo(null);
+  };
+
+  // Sevkiyat grouped assignment submit handler (moved inside component)
+  const commitSevkiyatAtaGroup = () => {
+    if (!sevkiyatGroup) return;
+
+    const hedefNo =
+      sevkiyatTargetNo === "yeni"
+        ? nextCode(sevkiyatTargetTip)
+        : sevkiyatTargetNo;
+
+    if (!hedefNo) {
+      setHata("Hedef palet/sandık seçin.");
+      return;
+    }
+
+    // Hedef konteyner yoksa oluştur
+    if (sevkiyatTargetNo === "yeni") {
+      setPaletler((prev) => [
+        ...prev,
+        {
+          no: hedefNo,
+          tip: sevkiyatTargetTip,
+          siparis: selectedSiparis?.no || siparisler[0].no,
+          urunKodlari: [],
+          adet: 0,
+          durum: "Hazırlanıyor",
+          sevkiyatYetkilisi: seciliSevkiyatYetkilisi || undefined,
+          children: [],
+        },
+      ]);
+    }
+
+    // Halihazırda atanmış küçük paketleri (kutu/poşet) çıkar
+    const alreadyAssigned = new Set<string>();
+    for (const p of paletler) {
+      if (p.tip === "Palet" || p.tip === "Sandık") {
+        for (const ch of p.children || []) alreadyAssigned.add(ch);
+      }
+    }
+
+    // Bu gruptan atanabilecek maksimum adet kadar çocuk seç
+    const available = sevkiyatGroup.children
+      .filter((ch) => !alreadyAssigned.has(ch))
+      .slice(0, Math.max(1, Math.min(sevkiyatGroup.kalan, sevkiyatQty)));
+
+    if (available.length === 0) {
+      setHata("Atanacak uygun kapsül yok.");
+      return;
+    }
+
+    // Seçilen çocukları hedef konteynere ekle
+    setPaletler((prev) =>
+      prev.map((p) =>
+        p.no === hedefNo
+          ? { ...p, children: Array.from(new Set([...(p.children || []), ...available])) }
+          : p
+      )
+    );
+    // Merge available children into childrenHints for the target container
+    setChildrenHints(prev => ({
+      ...prev,
+      [hedefNo]: Array.from(new Set([...(prev[hedefNo] || []), ...available]))
+    }));
+
+    // Ürün adetlerini çocuklardan hedef konteynere taşı
+    const productChildMoves: Record<string, { child: string; qty: number }[]> = {};
+    setUrunler((prev) => {
+      const yeni = prev.map((u) => {
+        let movedByUrun = 0;
+        const rest: UrunAtama[] = [];
+
+        for (const a of u.atananlar) {
+          if (available.includes(a.no)) {
+            if (!productChildMoves[u.kod]) productChildMoves[u.kod] = [];
+            productChildMoves[u.kod].push({ child: a.no, qty: a.adet });
+            movedByUrun += a.adet;
+          } else {
+            rest.push(a);
+          }
+        }
+
+        if (movedByUrun > 0) {
+          const idx = rest.findIndex((a) => a.no === hedefNo);
+          if (idx === -1) rest.push({ no: hedefNo, adet: movedByUrun });
+          else rest[idx] = { ...rest[idx], adet: rest[idx].adet + movedByUrun };
+        }
+
+        const yeniKalan = u.adet - rest.reduce((s, a) => s + a.adet, 0);
+        return { ...u, atananlar: rest, kalan: yeniKalan };
+      });
+
+      recomputeContainersFromUrunler(yeni);
+      return yeni;
+    });
+
+    // Hareket günlüğünü birleştir
+    setMoveLog((prev) => ({
+      ...prev,
+      [hedefNo]: {
+        ...(prev[hedefNo] || {}),
+        ...Object.fromEntries(
+          Object.entries(productChildMoves).map(([k, v]) => [
+            k,
+            [...(prev[hedefNo]?.[k] || []), ...v],
+          ])
+        ),
+      },
+    }));
+    recordCapsuleTotals(productChildMoves);
+
+    setSevkiyatModalOpen(false);
+    setSevkiyatGroup(null);
+    setSevkiyatQty(1);
+  };
+
+  const mevcutListesi = useMemo(() => {
+    if (!paketTipi) return [] as Konteyner[];
+    const tipLabel = paketTipi === "palet" ? "Palet"
+      : paketTipi === "sandik" ? "Sandık"
+      : paketTipi === "kutu" ? "Kutu"
+      : paketTipi === "poset" ? "Poşet" : "";
+    return tipLabel ? paletlerFlat.filter((p) => p.tip === tipLabel) : [];
+  }, [paketTipi, paletlerFlat]);
+
+  // ----- helpers -----
+
+  const getAssignedTypesForProduct = (urun: Urun) => {
+    const set = new Set<string>();
+    for (const a of urun.atananlar) {
+      const c = paletMap.get(a.no);
+      if (c) set.add(c.tip);
+    }
+    return Array.from(set);
+  };
+
+  const isPaletSandik = (no: string) => {
+    const t = paletMap.get(no)?.tip;
+    return t === "Palet" || t === "Sandık";
+  };
+
+  const getPSTypesForProduct = (u: Urun) => {
+    const types = new Set<string>();
+    for (const a of u.atananlar) {
+      if (!isPaletSandik(a.no)) continue;
+      const t = paletMap.get(a.no)?.tip;
+      if (t) types.add(t);
+    }
+    return Array.from(types);
+  };
+
+  const getPSAssignments = (u: Urun) => u.atananlar.filter(a => isPaletSandik(a.no));
+  const handleAtaClick = (urun: Urun) => {
+    setSelectedUrun(urun);
+    setPaketTipi("");
+    setSeciliKonteyner("");
+    setAdet(urun.kalan);
+    setHata("");
+    const defaultPaketleyen = urun.istasyon ? (ISTASYON_PAKETLEYEN[urun.istasyon] || "") : "";
+    setSeciliPaketleyen(defaultPaketleyen);
+    setSeciliSevkiyatYetkilisi(selectedSiparis?.paketleyenler?.[0] || "");
+    setShowModal(true);
+  };
+
+  const nextCode = (tip: "Palet" | "Sandık" | "Kutu" | "Poşet") => {
+    const prefix = tip === "Palet" ? "P" : tip === "Sandık" ? "S" : tip === "Kutu" ? "K" : "P"; // Poşet -> P
+    const nums = paletler
+      .filter((p) => p.tip === tip)
+      .map((p) => parseInt(p.no.replace(/\D/g, ""), 10))
+      .filter((n) => !isNaN(n));
+    const max = nums.length ? Math.max(...nums) : 0;
+    const next = String(max + 1).padStart(3, "0");
+    return `${prefix}${next}`;
+  };
+
+  const nextStationCode = (tip: "Kutu" | "Poşet", istasyon?: string) => {
+    const sk = istasyon ? ISTASYON_KOD[istasyon] : undefined;
+    const localPrefix = tip === "Kutu" ? "K" : "P";
+    if (!sk) return `${localPrefix}${String( (paletler.filter(p => p.tip===tip).length) + 1 ).padStart(3, "0")}`;
+    const pattern = `${sk}-${localPrefix}`;
+    const nums = paletler
+      .filter(p => p.tip === tip && p.no.startsWith(pattern))
+      .map(p => parseInt(p.no.replace(/\D/g, ''), 10))
+      .filter(n => !isNaN(n));
+    const max = nums.length ? Math.max(...nums) : 0;
+    return `${sk}-${localPrefix}${String(max + 1).padStart(3, '0')}`;
+  };
+
+  function getContainerLines(no: string) {
+    const lines: { kod: string; ad: string; adet: number }[] = [];
+    for (const u of urunler) {
+      const found = u.atananlar.find((a) => a.no === no);
+      if (found) lines.push({ kod: u.kod, ad: u.ad, adet: found.adet });
+    }
+    return lines;
+  }
+
+  const getOrderContainers = (orderNo: string) => paletler.filter((p) => p.siparis === orderNo);
+
+  const getOrderItemSummary = (orderNo: string) => {
+    const containers = new Set(getOrderContainers(orderNo).map((c) => c.no));
+    const map = new Map<string, { kod: string; ad: string; adet: number }>();
+    for (const u of urunler) {
+      let sum = 0;
+      for (const a of u.atananlar) if (containers.has(a.no)) sum += a.adet;
+      if (sum > 0) map.set(u.kod, { kod: u.kod, ad: u.ad, adet: sum });
+    }
+    return Array.from(map.values());
+  };
+
+  // Palet/Sandık için çocuk (kutu/poşet) listesi; state + hint + hareket defterinden toparla
+  const getParentChildren = (no: string): string[] => {
+    const s = new Set<string>();
+    const fromState = paletMap.get(no)?.children || [];
+    for (const c of fromState) s.add(c);
+    const fromHints = childrenHints[no] || [];
+    for (const c of fromHints) s.add(c);
+    const log = moveLog[no];
+    if (log) {
+      for (const arr of Object.values(log)) {
+        for (const { child } of arr) s.add(child);
+      }
+    }
+    return Array.from(s);
+  };
+
+  // Find current parent (Palet/Sandık) of a child capsule (kutu/poşet); returns container no or undefined
+  const getChildParent = (childNo: string): string | undefined => {
+    // from explicit state
+    for (const p of paletler) {
+      if (p.tip === 'Palet' || p.tip === 'Sandık') {
+        const kids = new Set([...(p.children || []), ...((childrenHints[p.no] || []))]);
+        if (kids.has(childNo)) return p.no;
+      }
+    }
+    // from move logs
+    for (const [parent, moves] of Object.entries(moveLog)) {
+      const any = Object.values(moves).some(arr => arr.some(e => e.child === childNo));
+      if (any) return parent;
+    }
+    return undefined;
+  };
+
+  const getContainerPrintData = (containerNo: string) => {
+    const container = paletMap.get(containerNo);
+    const items = getContainerLines(containerNo);
+    const children = getParentChildren(containerNo);
+    const log = moveLog[containerNo] || {};
+    const childDetails = children.map((childNo) => {
+      const details: { kod: string; ad: string; adet: number }[] = [];
+      for (const [urunKod, entries] of Object.entries(log)) {
+        const total = entries
+          .filter((entry) => entry.child === childNo)
+          .reduce((sum, entry) => sum + entry.qty, 0);
+        if (total > 0) {
+          const product = urunMap.get(urunKod);
+          details.push({ kod: urunKod, ad: product?.ad || "-", adet: total });
+        }
+      }
+      let toplam = details.reduce((s, d) => s + d.adet, 0);
+      if (toplam === 0) {
+        const fallback = capsuleArchive[childNo] || 0;
+        if (fallback > 0) {
+          details.push({ kod: "-", ad: "Toplam", adet: fallback });
+          toplam = fallback;
+        }
+      }
+      const { prefix } = parseStationAndType(childNo);
+      const istasyon = prefix ? PREFIX_TO_ISTASYON[prefix] || prefix : undefined;
+      return {
+        no: childNo,
+        istasyon,
+        toplam,
+        items: details,
+      };
+    });
+
+    const istasyonSorumlulari = Array.from(
+      new Map(
+        childDetails
+          .filter((c) => c.istasyon)
+          .map((c) => {
+            const sorumlu = c.istasyon ? ISTASYON_PAKETLEYEN[c.istasyon] || "-" : "-";
+            return [c.istasyon, sorumlu] as const;
+          })
+      ).entries()
+    ).map(([istasyon, sorumlu]) => ({ istasyon, sorumlu }));
+
+    const toplamAdet = container?.adet ?? items.reduce((sum, row) => sum + row.adet, 0);
+
+    return {
+      no: containerNo,
+      tip: container?.tip || "Palet",
+      siparis: container?.siparis || selectedSiparis?.no || siparisler[0].no,
+      musteri: selectedSiparis?.musteriAdi || siparisler[0].musteriAdi,
+      aracTuru: container?.aracTuru,
+      aracNo: container?.aracNo,
+      soforAdi: container?.soforAdi,
+      sevkiyatYetkilisi: container?.sevkiyatYetkilisi,
+      istasyonlar: istasyonSorumlulari,
+      toplamAdet,
+      children: childDetails,
+      items,
+    };
+  };
+
+  const getStationPrintData = (productCode: string) => {
+    const urun = urunler.find((u) => u.kod === productCode);
+    if (!urun) return null;
+    const assignments = urun.atananlar.map((a) => {
+      const container = paletMap.get(a.no);
+      return {
+        paketNo: a.no,
+        tip: container?.tip,
+        adet: a.adet,
+        paketleyen: a.paketleyen || (urun.istasyon ? ISTASYON_PAKETLEYEN[urun.istasyon] : undefined) || "-",
+      };
+    });
+    const toplamAtanan = assignments.reduce((sum, a) => sum + a.adet, 0);
+    return {
+      urun,
+      assignments,
+      kalan: urun.kalan,
+      toplamAtanan,
+      siparis: selectedSiparis?.no || siparisler[0].no,
+      musteri: selectedSiparis?.musteriAdi || siparisler[0].musteriAdi,
+    };
+  };
+
+  const getSmallCapsuleSummary = (childNo: string) => {
+    const { prefix, tip } = parseStationAndType(childNo);
+    const istasyon = prefix ? PREFIX_TO_ISTASYON[prefix] || prefix : undefined;
+    let toplam = 0;
+    for (const u of urunler) {
+      for (const a of u.atananlar) {
+        if (a.no === childNo) toplam += a.adet;
+      }
+    }
+    if (toplam === 0) toplam = capsuleArchive[childNo] || 0;
+    return {
+      no: childNo,
+      tip,
+      istasyon,
+      toplam,
+    };
+  };
+
+  const getShipmentGroupPrintData = (groupKey: string) => {
+    const group = sevkiyatGruplari.find((g) => g.key === groupKey);
+    if (!group) return null;
+    const assigned = Object.entries(group.assignedMap).map(([paletNo, cnt]) => {
+      const container = paletMap.get(paletNo);
+      let toplamAdet = container?.adet ?? 0;
+      if (toplamAdet === 0) {
+        for (const u of urunler) {
+          for (const a of u.atananlar) {
+            if (a.no === paletNo) toplamAdet += a.adet;
+          }
+        }
+      }
+      return {
+        paletNo,
+        tip: container?.tip || "Palet",
+        sevkiyatYetkilisi: container?.sevkiyatYetkilisi || "-",
+        kapsulSayisi: cnt,
+        toplamAdet,
+      };
+    });
+    const capsules = group.children.map(getSmallCapsuleSummary);
+    const istasyonAdi = PREFIX_TO_ISTASYON[group.prefix] || group.prefix;
+    return {
+      key: group.key,
+      tip: group.tip,
+      paketNoOzet: istasyonAdi,
+      istasyonAdi,
+      children: capsules,
+      assigned,
+      siparis: selectedSiparis?.no || siparisler[0].no,
+      musteri: selectedSiparis?.musteriAdi || siparisler[0].musteriAdi,
+    };
+  };
+
+  // Adjust how many children from a Sevkiyat group should be under a specific parent container
+  const handleGroupSetCount = (g: any, parentNo: string, newCount: number) => {
+    const current = g.assignedMap[parentNo] || 0;
+    const target = Math.max(0, Math.min(newCount, g.adet));
+    if (target === current) return;
+
+    if (target < current) {
+      // remove (current - target) children from this parent
+      let toRemove = current - target;
+      while (toRemove > 0) {
+        handleGroupUnassignOne(g, parentNo);
+        toRemove -= 1;
+      }
+      return;
+    }
+    // need to add (target - current) children from the group's unassigned pool
+    let need = target - current;
+    const available = g.children.filter((ch: string) => !getChildParent(ch));
+    const toAdd = available.slice(0, need);
+    if (toAdd.length === 0) return; // nothing available
+
+    // add these children under the parentNo and move product quantities accordingly
+    setPaletler(prev => prev.map(p => p.no === parentNo ? { ...p, children: Array.from(new Set([...(p.children || []), ...toAdd])) } : p));
+    setChildrenHints(prev => ({ ...prev, [parentNo]: Array.from(new Set([...(prev[parentNo] || []), ...toAdd])) }));
+
+    const productChildMoves: Record<string, { child: string; qty: number }[]> = {};
+    setUrunler(prev => {
+      const yeni = prev.map(u => {
+        let moved = 0;
+        const rest: UrunAtama[] = [];
+        for (const a of u.atananlar) {
+          if (toAdd.includes(a.no)) {
+            if (!productChildMoves[u.kod]) productChildMoves[u.kod] = [];
+            productChildMoves[u.kod].push({ child: a.no, qty: a.adet });
+            moved += a.adet;
+          } else {
+            rest.push(a);
+          }
+        }
+        if (moved > 0) {
+          const idx = rest.findIndex(a => a.no === parentNo);
+          if (idx === -1) rest.push({ no: parentNo, adet: moved });
+          else rest[idx] = { ...rest[idx], adet: rest[idx].adet + moved };
+        }
+        const yeniKalan = u.adet - rest.reduce((s, a) => s + a.adet, 0);
+        return { ...u, atananlar: rest, kalan: yeniKalan };
+      });
+      recomputeContainersFromUrunler(yeni);
+      return yeni;
+    });
+
+    setMoveLog(prev => ({
+      ...prev,
+      [parentNo]: {
+        ...(prev[parentNo] || {}),
+        ...Object.fromEntries(Object.entries(productChildMoves).map(([k, v]) => [k, [ ...(prev[parentNo]?.[k] || []), ...v ]]))
+      }
+    }));
+    recordCapsuleTotals(productChildMoves);
+  };
+
+  // Sipariş barkodunu (order-level) popover açıldığında üretir
+  const ensureOrderQr = async (orderNo: string) => {
+    const key = `order:${orderNo}`;
+    if (qrMap[key]) return;
+    const items = getOrderItemSummary(orderNo);
+    const containers = getOrderContainers(orderNo).map((c) => ({ no: c.no, tip: c.tip }));
+    const data = await QRCode.toDataURL(
+      JSON.stringify({ type: "order", order: orderNo, items, containers })
+    );
+    setQrMap((prev) => ({ ...prev, [key]: data }));
+  };
+
+  const recomputeContainersFromUrunler = (urunlerYeni: Urun[]) => {
+    // Ürün atamalarından konteyner özetini türet (sıfır adet olanlar gösterilmez)
+    const agg = new Map<string, { adet: number; set: Set<string> }>();
+    for (const u of urunlerYeni) {
+      for (const a of u.atananlar) {
+        if (!agg.has(a.no)) agg.set(a.no, { adet: 0, set: new Set<string>() });
+        const cur = agg.get(a.no)!;
+        cur.adet += a.adet;
+        cur.set.add(u.kod);
+      }
+    }
+
+    const out: Konteyner[] = [];
+    // Build from agg (nonzero adet)
+    for (const [no, val] of agg.entries()) {
+      if (val.adet <= 0) continue; // sıfır adet olanları listeleme
+      const prev = paletMap.get(no);
+      const inferTip = (() => {
+        const prevTip = prev?.tip;
+        if (prevTip) return prevTip;
+        // İstasyonlu format: XXX-<L><NNN>
+        const dash = no.indexOf('-');
+        if (dash > 0) {
+          const seg = no.slice(dash + 1); // e.g. P001, K002
+          if (seg.startsWith('K')) return 'Kutu';
+          if (seg.startsWith('P')) return 'Poşet';
+        }
+        // Sevkiyat formatı: P001/S002
+        if (no.startsWith('S')) return 'Sandık';
+        if (no.startsWith('P')) return 'Palet';
+        if (no.startsWith('K')) return 'Kutu';
+        return 'Palet';
+      })();
+      out.push({
+        no,
+        tip: inferTip,
+        siparis: selectedSiparis?.no || siparisler[0].no,
+        urunKodlari: Array.from(val.set),
+        adet: val.adet,
+        durum: prev?.durum || "Hazırlanıyor",
+        sevkiyatYetkilisi: prev?.sevkiyatYetkilisi,
+        children: (childrenHints[no] && childrenHints[no].length ? childrenHints[no] : prev?.children),
+      });
+    }
+    // Append existing containers with 0 adet if not already included
+    const aggNos = new Set(Array.from(agg.keys()));
+    for (const prev of paletler) {
+      if (!aggNos.has(prev.no)) {
+        out.push({
+          ...prev,
+          adet: 0,
+        });
+      }
+    }
+    setPaletler(out);
+  };
+
+  const kaydetAtama = () => {
+    if (!selectedUrun) return;
+    const kalan = selectedUrun.kalan;
+    const tipLabel: "Palet" | "Sandık" | "Kutu" | "Poşet" | "" =
+      paketTipi === "palet" ? "Palet" :
+      paketTipi === "sandik" ? "Sandık" :
+      paketTipi === "kutu" ? "Kutu" :
+      paketTipi === "poset" ? "Poşet" : "";
+
+    if (!paketTipi) {
+      setHata("Paket tipi seçilmelidir.");
+      return;
+    }
+    if (!seciliKonteyner) {
+      setHata("Mevcut konteyner seçilmeli veya Yeni oluşturulmalıdır.");
+      return;
+    }
+    if (!adet || adet < 1) {
+      setHata("Dağıtılacak adet 1 veya daha büyük olmalıdır.");
+      return;
+    }
+    if (adet > kalan) {
+      setHata(`Dağıtılacak adet kalan miktarı (${kalan}) aşamaz.`);
+      return;
+    }
+    const paketleyenName = selectedUrun?.istasyon ? (ISTASYON_PAKETLEYEN[selectedUrun.istasyon] || "") : "";
+    if (!paketleyenName) {
+      setHata("İstasyon için paketleyen tanımlı değil.");
+      return;
+    }
+    if (aktifAsama === "sevkiyat" && !seciliSevkiyatYetkilisi) {
+      setHata("Sevkiyat yetkilisi seçilmelidir.");
+      return;
+    }
+
+    let hedefNo = seciliKonteyner;
+    if (seciliKonteyner === "yeni") {
+      if (!tipLabel) {
+        setHata("Yeni oluşturmak için paket tipi seçin.");
+        return;
+      }
+      hedefNo = (aktifAsama === 'istasyon' && (tipLabel === 'Kutu' || tipLabel === 'Poşet'))
+        ? nextStationCode(tipLabel as ('Kutu'|'Poşet'), selectedUrun?.istasyon)
+        : nextCode(tipLabel);
+      // Sevkiyat aşamasında yeni konteyner açılıyorsa, sevkiyat yetkilisini atayalım
+      if (aktifAsama === "sevkiyat") {
+        setPaletler(prev => ([
+          ...prev,
+          {
+            no: hedefNo,
+            tip: tipLabel,
+            siparis: selectedSiparis?.no || siparisler[0].no,
+            urunKodlari: [],
+            adet: 0,
+            durum: "Hazırlanıyor",
+            sevkiyatYetkilisi: seciliSevkiyatYetkilisi || undefined,
+          },
+        ]));
+      }
+    }
+    // İstasyon aşamasında: sadece kendi istasyon paket/poşetine atayabilir
+    if (aktifAsama === 'istasyon') {
+      const ist = selectedUrun?.istasyon;
+      const sk = ist ? ISTASYON_KOD[ist] : undefined;
+      if (tipLabel === 'Kutu' || tipLabel === 'Poşet') {
+        if (seciliKonteyner !== 'yeni') {
+          if (!sk || !hedefNo.startsWith(`${sk}-`)) {
+            setHata('Bu istasyon başka bir istasyonun paketine ürün atayamaz.');
+            return;
+          }
+        }
+      }
+    }
+    // If assigning to existing container in sevkiyat and it has no supervisor yet, set it
+    if (aktifAsama === "sevkiyat" && seciliKonteyner !== "yeni" && seciliSevkiyatYetkilisi) {
+      setPaletler(prev => prev.map(p => p.no === hedefNo && !p.sevkiyatYetkilisi
+        ? { ...p, sevkiyatYetkilisi: seciliSevkiyatYetkilisi }
+        : p
+      ));
+    }
+
+    // Ürün güncelle
+    const urunlerYeni = urunler.map((u) => {
+      if (u.kod !== selectedUrun.kod) return u;
+      const yeniKalan = (u.kalan || 0) - adet;
+      const idx = u.atananlar.findIndex((a) => a.no === hedefNo);
+      const yeniAtananlar = [...u.atananlar];
+      if (idx === -1) yeniAtananlar.push({ no: hedefNo, adet, paketleyen: paketleyenName || undefined });
+      else yeniAtananlar[idx] = {
+        ...yeniAtananlar[idx],
+        adet: yeniAtananlar[idx].adet + adet,
+        paketleyen: paketleyenName || yeniAtananlar[idx].paketleyen,
+      };
+      return { ...u, kalan: yeniKalan, atananlar: yeniAtananlar };
+    });
+
+    setUrunler(urunlerYeni);
+    recomputeContainersFromUrunler(urunlerYeni);
+    setShowModal(false);
+  };
+
+  // -------- Badge Edit Handlers ---------
+  const openEditPopover = (u: Urun, a: UrunAtama) => {
+    setEditPK({ urunKod: u.kod, paketNo: a.no });
+    setEditQty(a.adet);
+  };
+
+  const commitEditQty = () => {
+    if (!editPK) return;
+    setUrunler((prev) => {
+      const urunlerYeni = prev.map((u) => {
+        if (u.kod !== editPK.urunKod) return u;
+        const others = u.atananlar.filter((a) => a.no !== editPK.paketNo);
+        const othersSum = others.reduce((s, a) => s + a.adet, 0);
+        const maxAllowed = u.adet - othersSum; // bu pakete atanabilecek üst sınır
+        const newQty = Math.max(0, Math.min(editQty, maxAllowed));
+        const yeniAtananlar = newQty === 0 ? others : [...others, { no: editPK.paketNo, adet: newQty }];
+        const yeniKalan = u.adet - yeniAtananlar.reduce((s, a) => s + a.adet, 0);
+        return { ...u, atananlar: yeniAtananlar, kalan: yeniKalan };
+      });
+      recomputeContainersFromUrunler(urunlerYeni);
+      return urunlerYeni;
+    });
+    setEditPK(null);
+  };
+
+  const removeFromContainer = () => {
+    if (!editPK) return;
+    setUrunler((prev) => {
+      const urunlerYeni = prev.map((u) => {
+        if (u.kod !== editPK!.urunKod) return u;
+        const yeniAtananlar = u.atananlar.filter((a) => a.no !== editPK!.paketNo);
+        const yeniKalan = u.adet - yeniAtananlar.reduce((s, a) => s + a.adet, 0);
+        return { ...u, atananlar: yeniAtananlar, kalan: yeniKalan };
+      });
+      recomputeContainersFromUrunler(urunlerYeni);
+      return urunlerYeni;
+    });
+    setEditPK(null);
+  };
+  // Bir palet/sandık altından tek bir kutu/poşeti çıkart (hareketleri iade eder)
+  const unassignOneChild = (parentNo: string, childNo: string) => {
+    // 1) Ürün hareketlerini geri al
+    const log = moveLog[parentNo];
+    setUrunler(prev => {
+      const yeni = prev.map(u => {
+        let parentQty = 0;
+        let childReturn = 0;
+
+        // parent'taki toplam qty (bu ürün için)
+        const parentIdx = u.atananlar.findIndex(a => a.no === parentNo);
+        if (parentIdx !== -1) parentQty = u.atananlar[parentIdx].adet;
+
+        const rest = u.atananlar.filter((_, i) => i !== parentIdx);
+
+        // log varsa: sadece bu çocuğa taşınmış miktarı iade et
+        const entries = log?.[u.kod]?.filter(e => e.child === childNo) || [];
+        const movedBack = entries.reduce((s, e) => s + e.qty, 0);
+        if (movedBack > 0) {
+          childReturn = movedBack;
+        } else {
+          // log yoksa fallback: parent’taki kadarını iade et (tek çocuk varsayımı)
+          childReturn = parentQty;
+        }
+
+        if (parentQty > 0) {
+          const newParentQty = Math.max(0, parentQty - childReturn);
+          if (newParentQty > 0) rest.push({ no: parentNo, adet: newParentQty });
+        }
+
+        if (childReturn > 0) {
+          const cIdx = rest.findIndex(a => a.no === childNo);
+          if (cIdx === -1) rest.push({ no: childNo, adet: childReturn });
+          else rest[cIdx] = { ...rest[cIdx], adet: rest[cIdx].adet + childReturn };
+        }
+
+        const yeniKalan = u.adet - rest.reduce((s, a) => s + a.adet, 0);
+        return { ...u, atananlar: rest, kalan: yeniKalan };
+      });
+      recomputeContainersFromUrunler(yeni);
+      return yeni;
+    });
+
+    // 2) Parent’ın çocuk listesinden çıkar ve log/hints’i temizle
+    setPaletler(prev => prev.map(p => {
+      if (p.no !== parentNo) return p;
+      const kids = new Set(p.children || []);
+      kids.delete(childNo);
+      return { ...p, children: Array.from(kids) };
+    }));
+    setChildrenHints(prev => {
+      const cp = { ...prev };
+      if (cp[parentNo]) cp[parentNo] = cp[parentNo].filter(c => c !== childNo);
+      return cp;
+    });
+    setMoveLog(prev => {
+      const lp = { ...prev };
+      if (lp[parentNo]) {
+        const m = { ...lp[parentNo] };
+        Object.keys(m).forEach(k => (m[k] = (m[k] || []).filter(e => e.child !== childNo)));
+        lp[parentNo] = m;
+      }
+      return lp;
+    });
+  };
+
+  // Atanan paket(ler) rozetinden 1 kapsül çıkar
+  const handleGroupUnassignOne = (g: any, parentNo: string) => {
+    // bu gruptaki çocuklardan, parent altında bulunan ilkini bul
+    const parentKids = new Set(getParentChildren(parentNo));
+    const targetChild = g.children.find((ch: string) => parentKids.has(ch));
+    if (!targetChild) return;
+    unassignOneChild(parentNo, targetChild);
+  };
+  // -------- Cancel Container (Sevkiyat) ---------
+  const cancelContainer = (containerNo: string) => {
+    const log = moveLog[containerNo];
+
+    setUrunler(prev => {
+      const yeni = prev.map(u => {
+        const idx = u.atananlar.findIndex(a => a.no === containerNo);
+        if (idx === -1) return u;
+
+        const removedQty = u.atananlar[idx].adet;
+        const rest = u.atananlar.filter((_, i) => i !== idx);
+
+        if (log && log[u.kod] && log[u.kod].length > 0) {
+          // Loglu: aynı çocuklara, aynı miktarlarla iade et
+          for (const entry of log[u.kod]) {
+            const cIdx = rest.findIndex(a => a.no === entry.child);
+            if (cIdx === -1) rest.push({ no: entry.child, adet: entry.qty });
+            else rest[cIdx] = { ...rest[cIdx], adet: rest[cIdx].adet + entry.qty };
+          }
+        } else {
+          // Logsuz: eşit dağıtım yap ya da kalan'a iade et
+          const children = paletMap.get(containerNo)?.children || [];
+          if (children.length > 0) {
+            const base = Math.floor(removedQty / children.length);
+            let rem = removedQty % children.length;
+            for (const ch of children) {
+              const add = base + (rem > 0 ? 1 : 0);
+              if (rem > 0) rem -= 1;
+              if (add <= 0) continue;
+              const cIdx = rest.findIndex(a => a.no === ch);
+              if (cIdx === -1) rest.push({ no: ch, adet: add });
+              else rest[cIdx] = { ...rest[cIdx], adet: rest[cIdx].adet + add };
+            }
+          } else {
+            const yeniKalan = u.kalan + removedQty;
+            return { ...u, atananlar: rest, kalan: yeniKalan };
+          }
+        }
+
+        const yeniKalan = u.adet - rest.reduce((s, a) => s + a.adet, 0);
+        return { ...u, atananlar: rest, kalan: yeniKalan };
+      });
+      recomputeContainersFromUrunler(yeni);
+      return yeni;
+    });
+
+    // Konteyneri listeden düş ve logu temizle
+    setPaletler(prev => prev.filter(p => p.no !== containerNo));
+    setMoveLog(prev => {
+      const cp = { ...prev };
+      delete cp[containerNo];
+      return cp;
+    });
+  };
+  // -------- Container Status (Kapat -> Tamamlandı) ---------
+  const sealContainer = (no: string) => {
+    // Sipariş Detayı tamamlanmadan kapatma engellenir (ekstra güvenlik)
+    if (!tumUrunlerTamamlandi) return;
+    setPaletler((prev) => prev.map((p) => (p.no === no ? { ...p, durum: "Tamamlandı" } : p)));
+  };
+
+  const markLoaded = (no: string) => {
+    setPaletler((prev) => prev.map((p) => (p.no === no ? { ...p, durum: "Kamyona Yüklendi" } : p)));
+  };
+
+  // Sipariş Detayı tamamlanma durumu bozulursa tüm konteynerleri "Hazırlanıyor" yap
+  useEffect(() => {
+    if (!tumUrunlerTamamlandi) {
+      setPaletler(prev => prev.map(p => p.durum === "Tamamlandı" ? { ...p, durum: "Hazırlanıyor" } : p));
+    }
+  }, [tumUrunlerTamamlandi]);
+
+  // -------- Print Preview ---------
+  const openOrderPrint = (orderNo: string) => {
+    setPrintTarget({ type: "order", orderNo });
+    setPrintOpen(true);
+  };
+
+  const openContainerPrint = (containerNo: string) => {
+    setPrintTarget({ type: "container", containerNo });
+    setPrintOpen(true);
+  };
+
+  // Print QR üretimi (hedefe göre)
+  useEffect(() => {
+    const run = async () => {
+      if (!printTarget) return;
+      const newMap: Record<string, string> = {};
+      if (printTarget.type === "container") {
+        const no = printTarget.containerNo;
+        const data = getContainerPrintData(no);
+        const payload = {
+          type: "container",
+          no,
+          order: data.siparis,
+          tip: data.tip,
+          items: data.items,
+          sevkiyatYetkilisi: data.sevkiyatYetkilisi,
+          istasyonlar: data.istasyonlar,
+          children: data.children.map((child) => ({
+            no: child.no,
+            istasyon: child.istasyon,
+            toplam: child.toplam,
+            items: child.items,
+          })),
+        };
+        newMap[no] = await QRCode.toDataURL(JSON.stringify(payload));
+      } else if (printTarget.type === "station") {
+        const data = getStationPrintData(printTarget.product);
+        if (data) {
+          const payload = {
+            type: "station",
+            product: data.urun.kod,
+            name: data.urun.ad,
+            istasyon: data.urun.istasyon,
+            siparis: data.siparis,
+            musteri: data.musteri,
+            assignments: data.assignments,
+            kalan: data.kalan,
+          };
+          newMap[`station:${data.urun.kod}`] = await QRCode.toDataURL(JSON.stringify(payload));
+        }
+      } else if (printTarget.type === "shipmentGroup") {
+        const data = getShipmentGroupPrintData(printTarget.groupKey);
+        if (data) {
+          const payload = {
+            type: "shipmentGroup",
+            key: data.key,
+            tip: data.tip,
+            paketNoOzet: data.paketNoOzet,
+            siparis: data.siparis,
+            musteri: data.musteri,
+            assigned: data.assigned,
+            children: data.children,
+          };
+          newMap[`shipment:${data.key}`] = await QRCode.toDataURL(JSON.stringify(payload));
+        }
+      } else {
+        // order-level tek QR + opsiyonel container QR'leri
+        const items = getOrderItemSummary(printTarget.orderNo);
+        const containers = getOrderContainers(printTarget.orderNo).map((c) => ({
+          no: c.no,
+          tip: c.tip,
+        }));
+        newMap[`order:${printTarget.orderNo}`] = await QRCode.toDataURL(
+          JSON.stringify({ type: "order", order: printTarget.orderNo, items, containers })
+        );
+        for (const c of getOrderContainers(printTarget.orderNo)) {
+          const payload = { type: "container", no: c.no, order: c.siparis, items: getContainerLines(c.no) };
+          newMap[`${printTarget.orderNo}-${c.no}`] = await QRCode.toDataURL(JSON.stringify(payload));
+        }
+      }
+      setQrMap(newMap);
+    };
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [printTarget]);
+
+  // Panel üstünde “tek sipariş QR” göstermek istersek:
+  useEffect(() => {
+    const run = async () => {
+      const ord = selectedSiparis?.no;
+      if (!ord) {
+        setOrderQR("");
+        return;
+      }
+      const items = getOrderItemSummary(ord);
+      const containers = getOrderContainers(ord).map((c) => ({ no: c.no, tip: c.tip }));
+      const orderPayload = { type: "order", order: ord, items, containers };
+      setOrderQR(await QRCode.toDataURL(JSON.stringify(orderPayload)));
+    };
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSiparis, urunler, paletler]);
+
+  // Basit dev testleri
+  useEffect(() => {
+    const p = nextCode("Palet");
+    console.assert(/^P\d{3}$/.test(p), `nextCode Palet format hatası: ${p}`);
+    const s = nextCode("Sandık");
+    console.assert(/^S\d{3}$/.test(s), `nextCode Sandık format hatası: ${s}`);
+    const k = nextCode("Kutu");
+    console.assert(/^K\d{3}$/.test(k), `nextCode Kutu format hatası: ${k}`);
+    const b = nextCode("Poşet");
+    console.assert(/^P\d{3}$/.test(b), `nextCode Poşet format hatası: ${b}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ----- render -----
+  return (
+    <div className="p-6 space-y-6">
+      <style jsx global>{`
+        @media print {
+          @page { size: A4 landscape; margin: 10mm; }
+          @page { size: landscape; }
+          html, body { width: 100%; height: auto; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          .no-print { display: none !important; }
+          .print-container { width: 100vw !important; max-width: none !important; }
+        }
+      `}</style>
+      <h1 className="text-2xl font-bold">Paketleme Takip Paneli</h1>
+      <div className="flex gap-2 mb-2">
+        <Button variant={aktifAsama === "panel" ? "default" : "outline"} onClick={() => handleStageNavClick("panel")}>
+          1) Paketleme Takip Paneli
+        </Button>
+        <Button
+          variant={aktifAsama === "istasyon" ? "default" : "outline"}
+          onClick={() => handleStageNavClick("istasyon")}
+          className="pointer-events-none cursor-default"
+          aria-disabled={true}
+        >
+          2) İstasyon Paketleme
+        </Button>
+        <Button
+          variant={aktifAsama === "sevkiyat" ? "default" : "outline"}
+          onClick={() => handleStageNavClick("sevkiyat")}
+          className="pointer-events-none cursor-default"
+          aria-disabled={true}
+        >
+          3) Sevkiyat Paketleme
+        </Button>
+        <Button
+          variant={aktifAsama === "yukleme" ? "default" : "outline"}
+          onClick={() => handleStageNavClick("yukleme")}
+          className="pointer-events-none cursor-default"
+          aria-disabled={true}
+        >
+          4) Yükleme Alanı
+        </Button>
+      </div>
+
+      {/* Sipariş arama / liste */}
+      {aktifAsama === "panel" && (
+      <Card className="p-4">
+        <div className="grid grid-cols-5 gap-2 mb-4">
+          <Input placeholder="Sipariş No" />
+          <Input placeholder="Proje Adı" />
+          <Input placeholder="Başlangıç Tarihi" type="date" />
+          <Input placeholder="Bitiş Tarihi" type="date" />
+          <Button>Listele</Button>
+        </div>
+
+        <div className="flex items-center justify-between mb-4">
+          <div className="text-sm text-muted-foreground">
+            {selectedSiparis ? `Seçili sipariş: ${selectedSiparis.no}` : "Lütfen bir sipariş seçin."}
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!selectedSiparis}
+            onClick={handleGoToIstasyon}
+          >
+            İstasyon Paketlemeye Geç
+          </Button>
+        </div>
+
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>No</TableHead>
+              <TableHead>Sipariş Tarihi</TableHead>
+              <TableHead>Teslim Tarihi</TableHead>
+              <TableHead>Sipariş Adı</TableHead>
+              <TableHead>Süreç</TableHead>
+              <TableHead>Aşama</TableHead>
+              <TableHead>Müşteri Adı</TableHead>
+              <TableHead>Proje</TableHead>
+              <TableHead>Print</TableHead>
+              <TableHead>Barkod</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {siparisler.map((s, i) => (
+              <TableRow
+                key={i}
+                onClick={() => setSelectedSiparis(s)}
+                className={`cursor-pointer hover:bg-gray-100 ${selectedSiparis?.no === s.no ? "bg-muted" : ""}`}
+              >
+                <TableCell>{s.no}</TableCell>
+                <TableCell>{s.tarih}</TableCell>
+                <TableCell>{s.teslim}</TableCell>
+                <TableCell>{s.adi}</TableCell>
+                <TableCell>{s.surec}</TableCell>
+                <TableCell>
+                  {siparisAsama === "Araca Yüklendi" ? (
+                    <span className="px-2 py-1 text-xs rounded bg-green-100 border border-green-300 text-green-800">
+                      {siparisAsama}
+                    </span>
+                  ) : siparisAsama}
+                </TableCell>
+                <TableCell>{s.musteriAdi}</TableCell>
+                <TableCell>{s.proje}</TableCell>
+                <TableCell>
+                  <Button
+                    size="sm"
+                    disabled={!tumUrunlerTamamlandi}
+                    title={
+                      tumUrunlerTamamlandi
+                        ? "Sipariş Özeti Yazdır"
+                        : "Tüm ürünler tamamlanınca aktif olur"
+                    }
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openOrderPrint(s.no);
+                    }}
+                  >
+                    🖨️
+                  </Button>
+                </TableCell>
+                <TableCell>
+                  {tumUrunlerTamamlandi ? (
+                    <Popover onOpenChange={(open) => { if (open) ensureOrderQr(s.no); }}>
+                      <PopoverTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={(e) => e.stopPropagation()}
+                          title="Barkod Önizleme"
+                        >
+                          <Barcode className="w-4 h-4" />
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-56">
+                        <div className="flex items-center justify-between">
+                          <div className="text-sm font-medium">Sipariş Barkodu</div>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={(e) => { e.stopPropagation(); openOrderPrint(s.no); }}
+                          >
+                            Yazdır
+                          </Button>
+                        </div>
+                        <div className="mt-2 flex items-center justify-center">
+                          {qrMap[`order:${s.no}`]
+                            ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img src={qrMap[`order:${s.no}`]} alt="order-qr" className="w-32 h-32" />
+                            ) : (
+                              <span className="text-xs text-muted-foreground">Oluşturuluyor…</span>
+                            )}
+                        </div>
+                      </PopoverContent>
+                    </Popover>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled
+                      title="Barkod için tüm ürünler tamamlanmalı"
+                    >
+                      <Barcode className="w-4 h-4" />
+                    </Button>
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </Card>
+      )}
+
+      {/* Sipariş detayı */}
+      {aktifAsama === "istasyon" && selectedSiparis && (
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-semibold">Sipariş Detayı: {selectedSiparis.no}</h2>
+            <div className="flex items-center gap-2">
+              {tumUrunlerTamamlandi && (
+                <span className="px-2 py-1 text-xs rounded bg-green-100 border border-green-300">
+                  Paketleme Tamamlandı
+                </span>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!tumUrunlerTamamlandi}
+                title={tumUrunlerTamamlandi ? "Sevkiyat paketlemeye geç" : "Tüm ürünler tamamlanınca aktif olur"}
+                onClick={() => setAktifAsama("sevkiyat")}
+              >
+                Sevkiyata Geç
+              </Button>
+            </div>
+          </div>
+
+
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Ürün Kodu</TableHead>
+                <TableHead>Paketleyen</TableHead>
+                <TableHead>İstasyon Adı</TableHead>
+                <TableHead>Ürün Adı</TableHead>
+                <TableHead>Adet</TableHead>
+                <TableHead>Paket Türü</TableHead>
+                <TableHead>Atanan Paket(ler)</TableHead>
+                <TableHead>Kalan</TableHead>
+                <TableHead>Print</TableHead>
+                <TableHead>İşlem</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {urunler.map((u, i) => (
+                <TableRow key={i}>
+                  <TableCell>{u.kod}</TableCell>
+                  <TableCell>{u.istasyon ? (ISTASYON_PAKETLEYEN[u.istasyon] || '-') : '-'}</TableCell>
+                  <TableCell>{u.istasyon || "-"}</TableCell>
+                  <TableCell>{u.ad}</TableCell>
+                  <TableCell>{u.adet}</TableCell>
+                <TableCell>{(() => { const t = getPSTypesForProduct(u); return t.length ? t.join(", ") : "-"; })()}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-2">
+                      {u.atananlar && u.atananlar.length > 0 ? (
+                        u.atananlar.map((a, idx) => (
+                          <Popover
+                            key={`${u.kod}-${a.no}-${idx}`}
+                            open={!!editPK && editPK.urunKod === u.kod && editPK.paketNo === a.no}
+                            onOpenChange={(open) => {
+                              if (!open) setEditPK(null);
+                            }}
+                          >
+                            <PopoverTrigger asChild>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => openEditPopover(u, a)}
+                                className="text-left leading-tight"
+                              >
+                                <div className="flex flex-col">
+                                  <span className="font-medium">{a.no} ({a.adet})</span>
+                                  <span className="text-xs text-muted-foreground">
+                                    {(u.istasyon || "-")} · {(a.paketleyen || "-")}
+                                  </span>
+                                </div>
+                              </Button>
+                            </PopoverTrigger>
+                            <PopoverContent className="w-64">
+                              <div className="space-y-2">
+                                <div className="text-sm font-medium">Adet Güncelle</div>
+                                <Input
+                                  type="number"
+                                  value={
+                                    editPK && editPK.urunKod === u.kod && editPK.paketNo === a.no
+                                      ? editQty
+                                      : a.adet
+                                  }
+                                  onChange={(e) =>
+                                    setEditQty(parseInt(e.target.value || "0", 10))
+                                  }
+                                />
+                                <div className="flex gap-2 justify-end">
+                                  <Button variant="destructive" onClick={removeFromContainer}>
+                                    Paketten çıkar
+                                  </Button>
+                                  <Button onClick={commitEditQty}>Güncelle</Button>
+                                </div>
+                              </div>
+                            </PopoverContent>
+                          </Popover>
+                        ))
+                      ) : (
+                        <span className="text-muted-foreground">Henüz Atanmadı</span>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-2">
+                      <span>{u.kalan}</span>
+                      {u.kalan === 0 && (
+                        <span className="px-2 py-0.5 text-xs rounded-full bg-green-100 border border-green-300">
+                          Tamamlandı
+                        </span>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openStationPrint(u);
+                      }}
+                    >
+                      🖨️ Yazdır
+                    </Button>
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      size="sm"
+                      onClick={() => handleAtaClick(u)}
+                      disabled={u.kalan === 0}
+                      title={u.kalan === 0 ? "Bu ürün tamamen atandı" : "Ürünü paketle"}
+                    >
+                      📦 Ata
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
+
+      {/* Palet / Sandık Yönetimi */}
+      {aktifAsama === "sevkiyat" && (
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-semibold">Palet / Sandık Yönetimi</h2>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                title={sevkiyatTamamlandi ? "Yükleme alanına geç" : "Tüm palet/sandık kapanmadan ilerlenemez"}
+                disabled={!sevkiyatTamamlandi}
+                onClick={() => {
+                  if (!sevkiyatTamamlandi) return;
+                  setAktifAsama("yukleme");
+                }}
+              >
+                Yüklemeye Geç
+              </Button>
+            </div>
+          </div>
+          {/* Sevkiyat: Gruplanmış Kutu/Poşet görünümü */}
+          <div className="mb-6 border rounded p-3 bg-muted/20">
+            <div className="text-sm font-medium mb-2">İstasyondan Gelen (Gruplu): İstasyon + Tip</div>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Paket No</TableHead>
+                  <TableHead>Paket Türü</TableHead>
+                  <TableHead>KİAD</TableHead>
+                  <TableHead>Atanan Paketler</TableHead>
+                  <TableHead>Adet</TableHead>
+                  <TableHead>Kalan</TableHead>
+                  <TableHead>Tamamlandı</TableHead>
+                  <TableHead>Print</TableHead>
+                  <TableHead>İşlem</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {sevkiyatGruplari.map((g) => (
+                  <TableRow key={g.key}>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">
+                          {(PREFIX_TO_ISTASYON[g.prefix] || g.prefix).replace(/\s+/g, '')}:
+                        </span>
+                        <span>({g.children.join(', ')})</span>
+                      </div>
+                    </TableCell>
+                    <TableCell>{g.tip}</TableCell>
+                    <TableCell>
+                      <div className="relative inline-flex items-center group">
+                        <span>{g.kiad}</span>
+                        <span className="pointer-events-none absolute -top-8 left-1/2 -translate-x-1/2 whitespace-nowrap rounded bg-slate-900/90 px-2 py-1 text-xs text-white opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                          Kutu içi toplam ürün adedi
+                        </span>
+                        <span className="pointer-events-none absolute -top-3 left-1/2 h-2 w-2 -translate-x-1/2 rotate-45 bg-slate-900/90 opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-2">
+                        {Object.keys(g.assignedMap).length > 0 ? (
+                          Object.entries(g.assignedMap).map(([no, cnt]) => (
+                            <Popover key={no}>
+                              <PopoverTrigger asChild>
+                                <Button size="sm" variant="outline">{no} ({cnt})</Button>
+                              </PopoverTrigger>
+                              <PopoverContent className="w-64">
+                                <div className="space-y-2">
+                                  <div className="text-sm font-medium">Adet Güncelle</div>
+                                  <Input
+                                    type="number"
+                                    value={(groupEditCounts[`${g.key}-${no}`] ?? cnt).toString()}
+                                    onChange={(e) => {
+                                      const v = parseInt(e.target.value || '0', 10);
+                                      setGroupEditCounts(prev => ({ ...prev, [`${g.key}-${no}`]: isNaN(v) ? 0 : v }));
+                                    }}
+                                  />
+                                  <div className="flex gap-2 justify-end">
+                                    <Button variant="destructive" onClick={() => handleGroupUnassignOne(g, no)}>Paketten çıkar</Button>
+                                    <Button onClick={() => handleGroupSetCount(g, no, groupEditCounts[`${g.key}-${no}`] ?? cnt)}>Güncelle</Button>
+                                  </div>
+                                </div>
+                              </PopoverContent>
+                            </Popover>
+                          ))
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell>{g.adet}</TableCell>
+                    <TableCell>{g.kalan}</TableCell>
+                    <TableCell>
+                      {g.tamamlandi ? (
+                        <span className="px-2 py-0.5 text-xs rounded-full bg-green-100 border border-green-300">Tamamlandı</span>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">Hazırlanıyor</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Button size="sm" variant="outline" onClick={() => openShipmentGroupPrint(g.key)}>
+                        🖨️ Yazdır
+                      </Button>
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        size="sm"
+                        disabled={g.kalan === 0}
+                        title={g.kalan === 0 ? "Bu grupta atanacak kutu/poşet kalmadı" : "Bu gruptan ata"}
+                        onClick={() => {
+                          if (g.kalan === 0) return;
+                          setSevkiyatGroup(g);
+                          setSevkiyatQty(Math.max(1, g.kalan));
+                          setSevkiyatTargetTip('Palet');
+                          setSevkiyatTargetNo('');
+                          setHata('');
+                          setSevkiyatModalOpen(true);
+                        }}
+                      >
+                        {g.kalan === 0 ? "Tamamlandı" : "📦 Ata"}
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {sevkiyatGruplari.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={9} className="text-xs text-muted-foreground">İstasyondan gelen kutu/poşet bulunamadı.</TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
+          <div className="mt-4 text-right text-sm font-semibold text-red-600">
+            Toplam: Palet ({paletTipSayilari.Palet || 0}) / Sandık ({paletTipSayilari["Sandık"] || 0})
+          </div>
+
+      <Dialog open={sevkiyatModalOpen} onOpenChange={(open)=>{ setSevkiyatModalOpen(open); if(!open){ setSevkiyatGroup(null); setSevkiyatQty(1);} }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Ürün Paketleme Ataması</DialogTitle>
+          </DialogHeader>
+          {(sevkiyatGroup || seciliKucukNo) && (
+            <div className="space-y-3">
+              {sevkiyatGroup ? (
+                <>
+                  <p><b>Paket:</b> ({sevkiyatGroup.children.join(', ')})</p>
+                  <p><b>Kalan Adet:</b> {sevkiyatGroup.kalan}</p>
+                  <p><b>Paketleyen:</b> {seciliSevkiyatYetkilisi || '-'}</p>
+                </>
+              ) : (
+                <>
+                  <p><b>Kutu/Poşet:</b> {seciliKucukNo}</p>
+                  <p><b>Kalan Adet:</b> 1</p>
+                  <p><b>Paketleyen:</b> {seciliSevkiyatYetkilisi || '-'}</p>
+                </>
+              )}
+
+              <Select value={sevkiyatTargetTip} onValueChange={(v: any) => setSevkiyatTargetTip(v)}>
+                <SelectTrigger><SelectValue placeholder="Paket Tipi Seç (Palet / Sandık)" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="Palet">Palet</SelectItem>
+                  <SelectItem value="Sandık">Sandık</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <Select disabled={!sevkiyatTargetTip} onValueChange={(v: any) => setSevkiyatTargetNo(v)}>
+                <SelectTrigger>
+                  <SelectValue placeholder={sevkiyatTargetTip ? "Mevcut seç veya Yeni Oluştur" : "Önce paket tipini seçin"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {paletlerFlat.filter(p => p.tip === sevkiyatTargetTip).map((p, i) => (
+                    <SelectItem key={i} value={p.no}>{p.no} - {p.tip}</SelectItem>
+                  ))}
+                  <SelectItem value="yeni">Yeni Oluştur</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <Select value={seciliSevkiyatYetkilisi} onValueChange={(v: any) => setSeciliSevkiyatYetkilisi(v)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Sevkiyat yetkilisi" />
+                </SelectTrigger>
+                <SelectContent>
+                  {(selectedSiparis?.paketleyenler || []).map((ad, i) => (
+                    <SelectItem key={i} value={ad}>{ad}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              <Input
+                type="number"
+                placeholder="Atanacak Adet"
+                value={sevkiyatGroup ? sevkiyatQty : 1}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value || '1', 10);
+                  if (sevkiyatGroup) setSevkiyatQty(Math.max(1, Math.min(sevkiyatGroup.kalan, isNaN(v) ? 1 : v)));
+                }}
+              />
+
+              {hata && <div className="text-red-600 text-sm">{hata}</div>}
+
+              <div className="flex justify-end gap-2">
+                <Button variant="secondary" onClick={() => setSevkiyatModalOpen(false)}>İptal</Button>
+                <Button onClick={() => (sevkiyatGroup ? commitSevkiyatAtaGroup() : commitSevkiyatAta())}>Kaydet</Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+        </Card>
+      )}
+
+      {aktifAsama === "yukleme" && (
+        <Card className="p-4">
+          <h2 className="text-xl font-semibold mb-4">Yükleme Alanı</h2>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-4">
+            <Input placeholder="Kamyon / Araç No" />
+            <Input placeholder="Şoför Adı" />
+            <Input type="date" placeholder="Yükleme Tarihi" />
+            <Input placeholder="Not" />
+          </div>
+          <div className="text-sm text-muted-foreground mb-2">Barkod ile palet/sandık doğrulaması yapılabilir (entegrasyon burada).</div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>No</TableHead>
+                <TableHead>Tip</TableHead>
+                <TableHead>Kutu/Poşet Kaynakları</TableHead>
+                <TableHead>Toplam Adet</TableHead>
+                <TableHead>Araç Türü</TableHead>
+                <TableHead>Araç No / Plaka</TableHead>
+                <TableHead>Şoför Adı</TableHead>
+                <TableHead>Yazdır</TableHead>
+                <TableHead>Durum</TableHead>
+                <TableHead>Aksiyon</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {paletlerFlat.filter(p => p.tip === "Palet" || p.tip === "Sandık").map((p, i) => (
+                <TableRow key={i}>
+                  <TableCell>{p.no}</TableCell>
+                  <TableCell>{p.tip}</TableCell>
+                  <TableCell>
+                    {(() => { const kids = getParentChildren(p.no); return kids.length ? kids.join(", ") : "-"; })()}
+                  </TableCell>
+                  <TableCell>{p.adet}</TableCell>
+                  <TableCell>
+                    <Select
+                      value={p.aracTuru ?? undefined}
+                      onValueChange={(v: string) => updateContainer(p.no, { aracTuru: v })}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Araç türü seç" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {ARAC_TURLERI.map((t) => (
+                          <SelectItem key={t} value={t}>
+                            {t}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      placeholder="Araç No / Plaka"
+                      value={p.aracNo || ""}
+                      onChange={(e) => updateContainer(p.no, { aracNo: e.target.value })}
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      placeholder="Şoför Adı"
+                      value={p.soforAdi || ""}
+                      onChange={(e) => updateContainer(p.no, { soforAdi: e.target.value })}
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <Button size="sm" variant="outline" onClick={() => openContainerPrint(p.no)}>
+                      🖨️ Yazdır
+                    </Button>
+                  </TableCell>
+                  <TableCell>
+                    {p.durum === "Kamyona Yüklendi" ? (
+                      <span className="px-2 py-0.5 text-xs rounded-full bg-green-100 border border-green-300 text-green-800">
+                        Kamyona Yüklendi
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 text-xs rounded-full bg-amber-100 border border-amber-300 text-amber-800">
+                        {p.durum || "Hazırlanıyor"}
+                      </span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {p.durum === "Kamyona Yüklendi" ? (
+                      <span className="text-xs text-muted-foreground">Tamamlandı</span>
+                    ) : (
+                      <Button size="sm" variant="outline" onClick={() => markLoaded(p.no)}>
+                        Kamyona Yüklendi
+                      </Button>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+              {paletlerFlat.filter(p => p.tip === "Palet" || p.tip === "Sandık").length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={10} className="text-xs text-muted-foreground">Yüklemeye hazır palet/sandık bulunmuyor.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
+
+      {/* Print Preview Dialog */}
+      <Dialog open={printOpen} onOpenChange={setPrintOpen}>
+        <DialogContent className="max-w-3xl print-container">
+          <DialogHeader>
+            <DialogTitle>Yazdırma Önizleme</DialogTitle>
+          </DialogHeader>
+          {printTarget && (
+            <div className="space-y-4">
+              {printTarget.type === "container" ? (
+                (() => {
+                  const data = getContainerPrintData(printTarget.containerNo);
+                  return (
+                    <div className="border rounded p-4 space-y-3">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="space-y-1">
+                          <div className="text-xl font-bold">Palet / Sandık: {data.no}</div>
+                          <div className="text-sm text-muted-foreground">Sipariş No: {data.siparis}</div>
+                          <div className="text-sm text-muted-foreground">Müşteri: {data.musteri || '-'}</div>
+                          <div className="text-xs text-muted-foreground">Tarih: {new Date().toLocaleDateString()}</div>
+                        </div>
+                        {qrMap[data.no] && (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={qrMap[data.no]} alt="qr" className="w-24 h-24" />
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                        <div className="space-y-1 border rounded p-2">
+                          <div className="font-semibold text-xs uppercase text-muted-foreground">Palet</div>
+                          <div><b>Tip:</b> {data.tip}</div>
+                          <div><b>Toplam Adet:</b> {data.toplamAdet}</div>
+                          <div><b>Kutu / Poşet:</b> {data.children.length}</div>
+                        </div>
+                        <div className="space-y-1 border rounded p-2">
+                          <div className="font-semibold text-xs uppercase text-muted-foreground">Sevkiyat</div>
+                          <div><b>Yetkili:</b> {data.sevkiyatYetkilisi || "-"}</div>
+                        </div>
+                        <div className="space-y-1 border rounded p-2">
+                          <div className="font-semibold text-xs uppercase text-muted-foreground">İstasyonlar</div>
+                          {data.istasyonlar.length > 0 ? (
+                            <ul className="space-y-1">
+                              {data.istasyonlar.map((s) => (
+                                <li key={s.istasyon}><b>{s.istasyon}:</b> {s.sorumlu}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <div>-</div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="font-semibold text-sm">Palet Toplamı</div>
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead>Ürün</TableHead>
+                              <TableHead>Adet</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {data.items.map((l, idx) => (
+                              <TableRow key={`${data.no}-toplam-${idx}`}>
+                                <TableCell>{l.kod} - {l.ad}</TableCell>
+                                <TableCell>{l.adet}</TableCell>
+                              </TableRow>
+                            ))}
+                            {data.items.length === 0 && (
+                              <TableRow>
+                                <TableCell colSpan={2} className="text-xs text-muted-foreground">
+                                  Bu palette ürün kaydı bulunmuyor
+                                </TableCell>
+                              </TableRow>
+                            )}
+                          </TableBody>
+                        </Table>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="font-semibold text-sm">Kutu / Poşet Detayı</div>
+                        {data.children.length > 0 ? (
+                          data.children.map((child) => (
+                            <div key={child.no} className="rounded border divide-y">
+                              <div className="flex items-center justify-between px-3 py-2 bg-muted/40">
+                                <div className="font-semibold text-sm">{child.no}{child.istasyon ? ` · ${child.istasyon}` : ""}</div>
+                                <div className="text-sm">Toplam: {child.toplam}</div>
+                              </div>
+                              <Table>
+                                <TableHeader>
+                                  <TableRow>
+                                    <TableHead className="w-2/3">Ürün</TableHead>
+                                    <TableHead>Adet</TableHead>
+                                  </TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                  {child.items.length > 0 ? (
+                                    child.items.map((row, idx) => (
+                                      <TableRow key={`${child.no}-${idx}`}>
+                                        <TableCell>{row.kod === "-" ? row.ad : `${row.kod} - ${row.ad}`}</TableCell>
+                                        <TableCell>{row.adet}</TableCell>
+                                      </TableRow>
+                                    ))
+                                  ) : (
+                                    <TableRow>
+                                      <TableCell colSpan={2} className="text-xs text-muted-foreground">
+                                        Bu kapsül için ürün kaydı bulunmuyor
+                                      </TableCell>
+                                    </TableRow>
+                                  )}
+                                </TableBody>
+                              </Table>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="text-xs text-muted-foreground">Bu palete bağlı kutu/poşet bulunmuyor.</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : printTarget.type === "station" ? (
+                (() => {
+                  const data = getStationPrintData(printTarget.product);
+                  if (!data) return null;
+                  const qrKey = `station:${data.urun.kod}`;
+                  return (
+                    <div className="border rounded p-4 space-y-3">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="space-y-1">
+                          <div className="text-xl font-bold">Ürün: {data.urun.ad}</div>
+                          <div className="text-sm text-muted-foreground">Kod: {data.urun.kod}</div>
+                          <div className="text-sm text-muted-foreground">İstasyon: {data.urun.istasyon || '-'}</div>
+                          <div className="text-sm text-muted-foreground">Sipariş: {data.siparis} · Müşteri: {data.musteri}</div>
+                          <div className="text-xs text-muted-foreground">Tarih: {new Date().toLocaleDateString()}</div>
+                        </div>
+                        {qrMap[qrKey] && (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={qrMap[qrKey]} alt="station-qr" className="w-24 h-24" />
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                        <div className="space-y-1 border rounded p-2">
+                          <div className="font-semibold text-xs uppercase text-muted-foreground">Özet</div>
+                          <div><b>Toplam Atanan:</b> {data.toplamAtanan}</div>
+                          <div><b>Kalan:</b> {data.kalan}</div>
+                        </div>
+                        <div className="space-y-1 border rounded p-2 md:col-span-2">
+                          <div className="font-semibold text-xs uppercase text-muted-foreground">Not</div>
+                          <div>İstasyon bazlı dağıtımlar ve paketleyen bilgileri aşağıda listelenmiştir.</div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="font-semibold text-sm">Atanan Paketler</div>
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead>Paket No</TableHead>
+                              <TableHead>Tip</TableHead>
+                              <TableHead>Adet</TableHead>
+                              <TableHead>Paketleyen</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {data.assignments.length > 0 ? (
+                              data.assignments.map((row, idx) => (
+                                <TableRow key={`${data.urun.kod}-assign-${idx}`}>
+                                  <TableCell>{row.paketNo}</TableCell>
+                                  <TableCell>{row.tip || '-'}</TableCell>
+                                  <TableCell>{row.adet}</TableCell>
+                                  <TableCell>{row.paketleyen || '-'}</TableCell>
+                                </TableRow>
+                              ))
+                            ) : (
+                              <TableRow>
+                                <TableCell colSpan={4} className="text-xs text-muted-foreground">
+                                  Bu ürüne ait atama bulunmuyor
+                                </TableCell>
+                              </TableRow>
+                            )}
+                          </TableBody>
+                        </Table>
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : printTarget.type === "shipmentGroup" ? (
+                (() => {
+                  const data = getShipmentGroupPrintData(printTarget.groupKey);
+                  if (!data) return null;
+                  const qrKey = `shipment:${data.key}`;
+                  return (
+                    <div className="border rounded p-4 space-y-3">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="space-y-1">
+                          <div className="text-xl font-bold">İstasyon Grubu: {data.paketNoOzet}</div>
+                          <div className="text-sm text-muted-foreground">Tip: {data.tip}</div>
+                          <div className="text-sm text-muted-foreground">Sipariş: {data.siparis} · Müşteri: {data.musteri}</div>
+                          <div className="text-xs text-muted-foreground">Tarih: {new Date().toLocaleDateString()}</div>
+                        </div>
+                        {qrMap[qrKey] && (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={qrMap[qrKey]} alt="shipment-qr" className="w-24 h-24" />
+                        )}
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="font-semibold text-sm">Palet ve Kutu Detayı</div>
+                        {data.assigned.length > 0 ? (
+                          data.assigned.map((row, idx) => (
+                            <div key={`${data.key}-palet-${idx}`} className="rounded border divide-y">
+                              <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-muted/40 text-sm">
+                                <div className="font-semibold">{row.paletNo} · {row.tip}</div>
+                                <div className="text-xs text-muted-foreground">Sevkiyat Sorumlusu: {row.sevkiyatYetkilisi}</div>
+                                <div className="text-xs text-muted-foreground">Toplam Adet: {row.toplamAdet}</div>
+                                <div className="text-xs text-muted-foreground">Kutu / Poşet: {row.kapsulSayisi}</div>
+                              </div>
+                              <Table>
+                                <TableHeader>
+                                  <TableRow>
+                                    <TableHead>Kutu/Poşet No</TableHead>
+                                    <TableHead>İstasyon</TableHead>
+                                    <TableHead>Tip</TableHead>
+                                    <TableHead>Toplam Adet</TableHead>
+                                  </TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                  {data.children
+                                    .filter((child) => getChildParent(child.no) === row.paletNo)
+                                    .map((child, childIdx) => (
+                                      <TableRow key={`${row.paletNo}-child-${childIdx}`}>
+                                        <TableCell>{child.no}</TableCell>
+                                        <TableCell>{child.istasyon || '-'}</TableCell>
+                                        <TableCell>{child.tip || '-'}</TableCell>
+                                        <TableCell>{child.toplam}</TableCell>
+                                      </TableRow>
+                                    ))}
+                                  {data.children.filter((child) => getChildParent(child.no) === row.paletNo).length === 0 && (
+                                    <TableRow>
+                                      <TableCell colSpan={4} className="text-xs text-muted-foreground">Bu palete ait kutu/poşet bulunmuyor.</TableCell>
+                                    </TableRow>
+                                  )}
+                                </TableBody>
+                              </Table>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="text-xs text-muted-foreground">Bu gruba atanmış palet veya sandık yok.</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="text-base font-semibold">Sipariş: {printTarget.orderNo}</div>
+                    {/* QR IMAGE REMOVED FOR ORDER PRINT */}
+                  </div>
+                  <div className="text-sm">Müşteri: {siparisler.find(si => si.no === printTarget.orderNo)?.musteriAdi || "-"}</div>
+                  <div className="text-sm">İstasyon: {siparisler.find(si => si.no === printTarget.orderNo)?.istasyonAdi || "-"}</div>
+                  <div className="text-sm">Paketleyen(ler): {(siparisler.find(si => si.no === printTarget.orderNo)?.paketleyenler || []).join(", ")}</div>
+
+                  <div className="border rounded p-3">
+                    <div className="text-sm font-medium">Palet / Sandık Bazında Ürün Detayı</div>
+                    <Table className="mt-2">
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Palet/Sandık No</TableHead>
+                          <TableHead>Tip</TableHead>
+                          <TableHead>Ürün</TableHead>
+                          <TableHead>Adet</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {getOrderContainers(printTarget.orderNo).flatMap((c, idx) => {
+                          const lines = getContainerLines(c.no);
+                          if (lines.length === 0) {
+                            return [
+                              <TableRow key={`${c.no}-empty`}>
+                                <TableCell>{c.no}</TableCell>
+                                <TableCell>{c.tip}</TableCell>
+                                <TableCell colSpan={2} className="text-muted-foreground text-xs">
+                                  Bu palet/sandıkta ürün bulunmuyor
+                                </TableCell>
+                              </TableRow>
+                            ];
+                          }
+                          return lines.map((l, i) => (
+                            <TableRow key={`${c.no}-${i}`}>
+                              <TableCell>{c.no}</TableCell>
+                              <TableCell>{c.tip}</TableCell>
+                              <TableCell>{l.kod} - {l.ad}</TableCell>
+                              <TableCell>{l.adet}</TableCell>
+                            </TableRow>
+                          ));
+                        })}
+                        {getOrderContainers(printTarget.orderNo).length === 0 && (
+                          <TableRow>
+                            <TableCell colSpan={4} className="text-muted-foreground text-xs">
+                              Bu siparişe ait palet veya sandık bulunmuyor
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                  <div className="text-sm mt-2">
+                    {(() => {
+                      const oc = getOrderContainers(printTarget.orderNo);
+                      const paletCount = oc.filter(c => c.tip === "Palet").length;
+                      const sandikCount = oc.filter(c => c.tip === "Sandık").length;
+                      return (<span>Toplam: {sandikCount} Sandık, {paletCount} Palet</span>);
+                    })()}
+                  </div>
+                </div>
+              )}
+              <div className="flex justify-end gap-2">
+                <Button className="no-print" variant="secondary" onClick={() => setPrintOpen(false)}>
+                  Kapat
+                </Button>
+                <Button
+                  className="no-print"
+                  onClick={() => {
+                    try {
+                      // @ts-ignore
+                      window.print?.();
+                    } catch {}
+                    setPrintOpen(false);
+                  }}
+                >
+                  Yazdır
+                </Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Atama Modal */}
+      <Dialog open={showModal} onOpenChange={setShowModal}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Ürün Paketleme Ataması</DialogTitle>
+          </DialogHeader>
+          {selectedUrun && (
+            <div className="space-y-3">
+              <p>
+                <b>Ürün:</b> {selectedUrun.ad} ({selectedUrun.kod})
+              </p>
+              <p>
+                <b>Kalan Adet:</b> {selectedUrun.kalan}
+              </p>
+
+              <p>
+                <b>Paketleyen:</b> {selectedUrun.istasyon ? (ISTASYON_PAKETLEYEN[selectedUrun.istasyon] || "-") : "-"}
+              </p>
+
+              {aktifAsama === "sevkiyat" && (
+                <Select value={seciliSevkiyatYetkilisi} onValueChange={(v: any) => setSeciliSevkiyatYetkilisi(v)}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Sevkiyat yetkilisi seç" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(selectedSiparis?.paketleyenler || []).map((ad, i) => (
+                      <SelectItem key={i} value={ad}>{ad}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+
+              <Select
+                onValueChange={(v: any) => {
+                  setPaketTipi(v);
+                  setSeciliKonteyner("");
+                }}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder={aktifAsama === "sevkiyat" ? "Paket Tipi Seç (Palet / Sandık)" : "Paket Tipi Seç (Kutu / Poşet)"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {aktifAsama === "sevkiyat" ? (
+                    <>
+                      <SelectItem value="palet">Palet</SelectItem>
+                      <SelectItem value="sandik">Sandık</SelectItem>
+                    </>
+                  ) : (
+                    <>
+                      <SelectItem value="kutu">Kutu</SelectItem>
+                      <SelectItem value="poset">Poşet</SelectItem>
+                    </>
+                  )}
+                </SelectContent>
+              </Select>
+
+              <Select
+                disabled={!paketTipi}
+                onValueChange={(v: any) => setSeciliKonteyner(v)}
+              >
+                <SelectTrigger>
+                  <SelectValue
+                    placeholder={
+                      paketTipi ? "Mevcut seç veya Yeni Oluştur" : "Önce paket tipini seçin"
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {mevcutListesi
+                    .filter(p => {
+                      if (aktifAsama !== 'istasyon') return true;
+                      if (!(p.tip === 'Kutu' || p.tip === 'Poşet')) return true;
+                      const sk = selectedUrun?.istasyon ? ISTASYON_KOD[selectedUrun.istasyon] : undefined;
+                      return sk ? p.no.startsWith(`${sk}-`) : true;
+                    })
+                    .map((p, i) => (
+                      <SelectItem key={i} value={p.no}>
+                        {p.no} - {p.tip}
+                      </SelectItem>
+                    ))}
+                  <SelectItem value="yeni">Yeni Oluştur</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <Input
+                placeholder="Dağıtılacak Adet"
+                type="number"
+                value={adet}
+                onChange={(e) => setAdet(parseInt(e.target.value || "0", 10))}
+              />
+
+              {hata && <div className="text-red-600 text-sm">{hata}</div>}
+
+              <div className="flex justify-end space-x-2">
+                <Button variant="secondary" onClick={() => setShowModal(false)}>
+                  İptal
+                </Button>
+                <Button variant="default" onClick={kaydetAtama}>
+                  Kaydet
+                </Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
